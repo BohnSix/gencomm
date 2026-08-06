@@ -224,7 +224,157 @@ Stage3 是推理和测试。对于普通方法可以直接跑 `inference.py`，�
 - `m1` 显存比 `m2` 大，主要是 backbone 更深，不是 batch size
 - V2X-Real 要用专门的推理脚本，不要直接套 OPV2V 的命令
 
-## 10. 当前工作建议
+## 10. m1 / m2 / m3 / m4 的区别
+
+这四个配置都属于 V2X-Real 上的 GenComm stage1，同样使用：
+
+- `model.core_method: heter_model_baseline_w_gencomm_stage1`
+- `loss.core_method: point_pillar_v2xreal_gencomm_loss`
+- `fusion.core_method: intermediateheterv2xreal`
+- `fusion.dataset: v2xreal`
+- `assignment_path: opencood/modality_assign/v2xreal_4modality.json`
+
+它们的主要区别不在训练流程，而在**ego 模态、模态映射、backbone 深度、以及最后特征维度**上。
+
+### 1. 共同点
+
+四个配置都在做同一件事：
+
+- 用同一个 V2X-Real 数据集划分
+- 用同一个异构协同框架
+- 用同一个 GenComm stage1 模型类
+- 用同一个消息提取器和融合流程
+
+也就是说，`m1`、`m2`、`m3`、`m4` 不是四个完全不同的方法，而是四个**以不同智能体为基座**的训练配置。
+
+### 2. ego 模态不同
+
+每个配置都把自己的模态设成 ego：
+
+- `m1_att.yaml` 的 `ego_modality` 是 `m1`
+- `m2_att.yaml` 的 `ego_modality` 是 `m2`
+- `m3_att.yaml` 的 `ego_modality` 是 `m3`
+- `m4_att.yaml` 的 `ego_modality` 是 `m4`
+
+这意味着训练时，当前模态会作为主干协同基座，其他模态会按 `mapping_dict` 映射到该基座上。
+
+### 3. mapping_dict 的作用
+
+stage1 里 `mapping_dict` 的写法本质上是：把所有智能体都临时映射到当前 ego 模态。
+
+例如 `m1_att.yaml` 里：
+
+```yaml
+mapping_dict:
+  m1: m1
+  m2: m1
+  m3: m1
+  m4: m1
+```
+
+表示训练这一版时，所有模态都按 `m1` 的结构来走。
+
+`m2 / m3 / m4` 的配置也是同样逻辑，只是目标 ego 变了。
+
+### 4. backbone 差异
+
+这是最关键的区别，也是显存差异的来源。
+
+#### m1
+
+`m1` 使用的是最完整的 backbone：
+
+```yaml
+backbone_args:
+  layer_nums: [3, 5, 8]
+  layer_strides: [2, 2, 2]
+  num_filters: [64, 128, 256]
+  upsample_strides: [1, 2, 4]
+  num_upsample_filter: [128, 128, 128]
+```
+
+这意味着它有三层特征提取和三路上采样，最后拼接后的 `input_dim` 是 384。
+
+#### m2
+
+`m2` 比 `m1` 少一层：
+
+```yaml
+backbone_args:
+  layer_nums: [3, 5]
+  layer_strides: [2, 2]
+  num_filters: [64, 128]
+  upsample_strides: [1, 2]
+  num_upsample_filter: [128, 128]
+```
+
+最后 `input_dim` 是 256。
+
+#### m3
+
+`m3` 更轻，只保留最浅的一层：
+
+```yaml
+backbone_args:
+  layer_nums: [3]
+  layer_strides: [2]
+  num_filters: [64]
+  upsample_strides: [1]
+  num_upsample_filter: [128]
+```
+
+最后 `input_dim` 是 128。
+
+#### m4
+
+`m4` 最特殊，backbone 直接设为 identity：
+
+```yaml
+backbone_args: 'identity'
+```
+
+也就是说它不再走完整的 BEV backbone，只保留很轻的后续压缩和消息提取逻辑，所以最后 `input_dim` 只有 64。
+
+### 5. 显存和速度差异
+
+四者的显存/速度通常是：
+
+```text
+m1 > m2 > m3 > m4
+```
+
+原因是：
+
+- `m1` backbone 最深，特征图最多
+- `m2` 次之
+- `m3` 更浅
+- `m4` 几乎不做 backbone 提取
+
+所以你看到 `m1` 显存比 `m2` 大，是正常现象，不是 batch size 的问题。
+
+### 6. 训练时的实际含义
+
+这四个配置分别对应四种不同的基座训练：
+
+- `m1`：最强的 LiDAR 基座，最重，但表达能力最好
+- `m2`：中等复杂度基座
+- `m3`：轻量基座
+- `m4`：最轻，适合极简输入路径或特殊异构设置
+
+在 stage2 里，这四个基座会被重新组合，用来训练 `m1m2`、`m1m3`、`m1m4` 等异构组合。
+
+### 7. 直接看配置时的快速判断
+
+你可以只看这几个字段判断差异：
+
+- `ego_modality`
+- `mapping_dict`
+- `backbone_args`
+- `shrink_header.input_dim`
+
+其中最能说明显存差异的是 `backbone_args` 和 `input_dim`。
+
+## 11. 当前工作建议
 
 如果继续做 V2X-Real 训练，建议按这个顺序：
 
