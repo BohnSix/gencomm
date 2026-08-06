@@ -797,7 +797,572 @@ reuse_value: *some_name
 - `in_head` / `att.feat_dim` / `message_extractor.in_ch`：必须和 shrink 后的 BEV 特征通道一致。
 - `num_class` 和 anchor 配置：必须和数据集类别一致。
 
-## 12. 当前工作建议
+## 12. HeterModelBaselineWGenCommStage1 模型详解
+
+`HeterModelBaselineWGenCommStage1` 位于 `opencood/models/heter_model_baseline_w_gencomm_stage1.py`，是 GenComm stage1 使用的主模型类。它不是一个单纯的 encoder，而是一个完整的协同感知检测模型：从 LiDAR 点云编码，到 BEV backbone，到消息提取、GenComm 特征生成、协同融合，最后输出检测头预测。
+
+### 1. 这个模型解决什么问题
+
+stage1 的目标是训练某一种智能体类型的同构协同基座。以 V2X-Real 的 `m1_att.yaml` 为例，`mapping_dict` 会把 `m1/m2/m3/m4` 都映射成 `m1`，所以这一轮训练中所有协作方都按同一个 `m1` 特征提取结构处理。
+
+模型要学到三件事：
+
+- 如何从单车 LiDAR 点云提取 BEV 特征
+- 如何从 BEV 特征中抽取低维通信消息
+- 如何用 GenComm 根据消息生成/重建用于融合的协作特征
+
+### 2. 初始化入口
+
+类定义是：
+
+```python
+class HeterModelBaselineWGenCommStage1(nn.Module):
+    def __init__(self, args):
+```
+
+这里的 `args` 来自 YAML 的：
+
+```yaml
+model:
+  args:
+```
+
+也就是说，YAML 中 `model.args` 下的字段会直接决定这个模型搭哪些模块。
+
+最先初始化的是：
+
+```python
+self.args = args
+self.gencomm = GenComm(args['gencomm'])
+self.missing_message = args.get('missing_message', False)
+```
+
+含义：
+
+- `self.gencomm` 是条件扩散生成模块，负责根据消息条件生成/重建 BEV 特征。
+- `missing_message` 是推理阶段的特殊开关，用来模拟协作消息缺失。
+
+### 3. 自动发现 m1/m2/m3/m4 模态
+
+模型会扫描 `args` 中所有形如 `m数字` 的 key：
+
+```python
+modality_name_list = list(args.keys())
+modality_name_list = [x for x in modality_name_list if x.startswith("m") and x[1:].isdigit()]
+self.modality_name_list = modality_name_list
+```
+
+例如 stage1 `m1_att.yaml` 里只有：
+
+```yaml
+model:
+  args:
+    m1:
+      ...
+```
+
+那么 `self.modality_name_list = ['m1']`。
+
+stage2 的 `m1m2_att.yaml` 里会有 `m1` 和 `m2` 两组配置，那么列表就是 `['m1', 'm2']`。
+
+### 4. 每个模态会构建哪些模块
+
+初始化时会对 `self.modality_name_list` 逐个循环：
+
+```python
+for modality_name in self.modality_name_list:
+    model_setting = args[modality_name]
+```
+
+每个模态都会构建四类模块：
+
+- encoder
+- backbone
+- shrinker
+- message extractor
+
+#### encoder
+
+encoder 通过反射从 `opencood.models.heter_encoders` 中加载：
+
+```python
+encoder_filename = "opencood.models.heter_encoders"
+encoder_lib = importlib.import_module(encoder_filename)
+target_model_name = model_setting['core_method'].replace('_', '')
+```
+
+例如 YAML 里：
+
+```yaml
+core_method: point_pillar
+```
+
+模型会在 `heter_encoders.py` 里寻找类名忽略大小写后等于 `pointpillar` 的 encoder 类。
+
+构建后挂到模型上：
+
+```python
+setattr(self, f"encoder_{modality_name}", encoder_class(model_setting['encoder_args']))
+```
+
+对于 `m1`，实际就是：
+
+```python
+self.encoder_m1 = PointPillar(...)
+```
+
+#### backbone
+
+backbone 有两种情况：
+
+```python
+if model_setting['backbone_args'] == 'identity':
+    setattr(self, f"backbone_{modality_name}", nn.Identity())
+else:
+    setattr(self, f"backbone_{modality_name}", BaseBEVBackbone(...))
+```
+
+所以：
+
+- `m1/m2/m3` 会构建不同深度的 `BaseBEVBackbone`
+- `m4` 会使用 `nn.Identity()`，基本跳过 backbone
+
+这也是 `m1 > m2 > m3 > m4` 显存差异的主要来源。
+
+#### shrinker
+
+```python
+setattr(self, f"shrinker_{modality_name}", DownsampleConv(model_setting['shrink_header']))
+```
+
+shrinker 的作用是把 backbone 多尺度拼接后的特征压到统一通道数。比如 `m1` 的 backbone 三路上采样拼接后是 384 通道，`shrink_header` 会把它变成 256 通道。
+
+#### message extractor
+
+```python
+setattr(
+    self,
+    f"message_extractor_{modality_name}",
+    MessageExtractorv2(args['message_extractor']['in_ch'], args['message_extractor']['out_ch'])
+)
+```
+
+`MessageExtractorv2` 位于 `opencood/models/gencomm_modules/message_extractor_v2.py`。当前实现内部使用 `BEVDeformableExtractor`：
+
+- 先用卷积预测 deformable convolution 的 offset
+- 再用 `DeformConv2d` 提取局部可变形特征
+- 通过一个通道注意力模块增强特征
+- 最后压到 `out_ch` 个消息通道
+
+在当前 YAML 中：
+
+```yaml
+message_extractor:
+  in_ch: 256
+  out_ch: 2
+```
+
+因此消息是从 256 通道 BEV 特征中提取出的 2 通道条件图。
+
+### 5. 坐标变换相关参数
+
+模型保存了 BEV 范围：
+
+```python
+self.cav_range = args['lidar_range']
+self.H = (self.cav_range[4] - self.cav_range[1])
+self.W = (self.cav_range[3] - self.cav_range[0])
+self.fake_voxel_size = 1
+```
+
+forward 中会调用：
+
+```python
+affine_matrix = normalize_pairwise_tfm(
+    data_dict['pairwise_t_matrix'], self.H, self.W, self.fake_voxel_size
+)
+```
+
+这个 `affine_matrix` 用于把不同智能体的 BEV 特征对齐到 ego 坐标系，是后续 enhancer 和 fusion 的几何基础。
+
+### 6. 融合模块选择
+
+模型通过 YAML 中的：
+
+```yaml
+fusion_method: att
+```
+
+选择融合模块。
+
+代码中支持：
+
+- `max` -> `MaxFusion`
+- `att` -> `AttFusion`
+- `disconet` -> `DiscoFusion`
+- `v2vnet` -> `V2VNetFusion`
+- `v2xvit` -> `V2XViTFusion`
+- `cobevt` -> `CoBEVT`
+- `where2comm` -> `Where2commFusion`
+- `who2com` -> `Who2comFusion`
+
+当前 V2X-Real GenComm stage1 使用的是：
+
+```yaml
+fusion_method: att
+att:
+  feat_dim: 256
+```
+
+所以实际构建的是：
+
+```python
+self.fusion_net = AttFusion(args['att']['feat_dim'])
+```
+
+### 7. 检测头
+
+检测头是共享的，不区分模态：
+
+```python
+self.cls_head = nn.Conv2d(args['in_head'], args['anchor_number'] * self.num_class * self.num_class, kernel_size=1)
+self.reg_head = nn.Conv2d(args['in_head'], 7 * args['anchor_number'] * self.num_class, kernel_size=1)
+self.dir_head = nn.Conv2d(args['in_head'], args['dir_args']['num_bins'] * args['anchor_number'], kernel_size=1)
+```
+
+在当前 V2X-Real 配置中：
+
+- `in_head = 256`
+- `anchor_number = 2`
+- `num_class = 3`
+- `dir_args.num_bins = 2`
+
+因此检测头输出包括：
+
+- `cls_preds`：分类预测
+- `reg_preds`：3D 框回归预测
+- `dir_preds`：方向分类预测
+
+### 8. enhancer
+
+如果 YAML 里有：
+
+```yaml
+enhancer:
+  in_ch: 256
+```
+
+就会构建：
+
+```python
+self.enhancer = Enhancer(self.args['enhancer']['in_ch'], [8, 8], 4)
+```
+
+它位于 `opencood/models/gencomm_modules/enhancer.py`，作用是在 GenComm 生成特征后，结合几何变换和协作关系进一步增强 BEV 特征。
+
+### 9. compressor 可选分支
+
+如果 YAML 中有 `compressor` 字段，会启用：
+
+```python
+self.compress = True
+self.compressor = NaiveCompressor(...)
+self.model_train_init()
+```
+
+`model_train_init()` 会冻结所有参数，只开放 compressor 训练：
+
+```python
+self.eval()
+for p in self.parameters():
+    p.requires_grad_(False)
+self.compressor.train()
+for p in self.compressor.parameters():
+    p.requires_grad_(True)
+```
+
+当前 V2X-Real stage1 配置没有使用这个分支。
+
+### 10. forward 输入数据
+
+forward 的签名是：
+
+```python
+def forward(self, data_dict):
+```
+
+这里的 `data_dict` 不是原始 dataset item，而是经过 dataset collate 和 `train_utils.to_device` 后的 `batch_data['ego']`。
+
+forward 一开始取出：
+
+```python
+agent_modality_list = data_dict['agent_modality_list']
+pairwise_t_matrix = data_dict['pairwise_t_matrix']
+record_len = data_dict['record_len']
+```
+
+这些字段含义：
+
+- `agent_modality_list`：当前 batch 中每个智能体对应哪个模态，比如 `['m1', 'm1', 'm1']`。
+- `pairwise_t_matrix`：智能体之间的坐标变换矩阵。
+- `record_len`：每个 batch 样本中有多少个智能体，用来把扁平化的特征重新分组。
+
+### 11. forward 第一步：逐模态提取特征和消息
+
+代码先统计 batch 中出现了哪些模态：
+
+```python
+modality_count_dict = Counter(agent_modality_list)
+```
+
+然后逐模态处理：
+
+```python
+feature = self.encoder_m1(data_dict, 'm1')
+feature = self.backbone_m1({'spatial_features': feature})['spatial_features_2d']
+feature = self.shrinker_m1(feature)
+message = self.message_extractor_m1(feature)
+```
+
+抽象成流程就是：
+
+```text
+点云 -> PointPillar encoder -> BEV backbone -> shrinker -> 256通道BEV特征
+256通道BEV特征 -> MessageExtractorv2 -> 2通道消息条件
+```
+
+结果保存到：
+
+```python
+modality_feature_dict[modality_name] = feature
+modality_message_dict[modality_name] = message
+```
+
+### 12. camera 分支兼容逻辑
+
+模型里有一段 camera crop/padding 逻辑：
+
+```python
+if self.sensor_type_dict[modality_name] == "camera":
+    crop_func = torchvision.transforms.CenterCrop((target_H, target_W))
+    modality_feature_dict[modality_name] = crop_func(feature)
+```
+
+当前 V2X-Real GenComm stage1 都是 LiDAR，所以这段通常不会走。但模型保留了 camera 分支，是因为这个文件来自一个统一的 LiDAR/Camera/heterogeneous 框架。
+
+### 13. forward 第二步：按智能体顺序重新组装特征
+
+前面是按模态批量处理的，后面要恢复到智能体顺序：
+
+```python
+for modality_name in agent_modality_list:
+    feat_idx = counting_dict[modality_name]
+    heter_feature_2d_list.append(modality_feature_dict[modality_name][feat_idx])
+    heter_message_list.append(modality_message_dict[modality_name][feat_idx])
+```
+
+最后得到：
+
+```python
+heter_feature_2d = torch.stack(heter_feature_2d_list)
+heter_message = torch.stack(heter_message_list)
+```
+
+可以理解为：
+
+```text
+heter_feature_2d: 所有智能体的 BEV 特征，按样本/智能体顺序排列
+heter_message: 所有智能体的通信消息，按相同顺序排列
+```
+
+### 14. missing_message 推理分支
+
+如果不是训练模式，并且 `missing_message=True`，模型会随机屏蔽一部分非 ego 消息：
+
+```python
+for i in range(1, heter_message.shape[0]):
+    mask = torch.rand(...) > 0.4
+    heter_message[i] = heter_message[i] * mask
+```
+
+这用于模拟协作消息缺失或通信不完整的推理场景。训练时不会触发。
+
+### 15. forward 第三步：GenComm 生成/重建特征
+
+核心调用是：
+
+```python
+conditions = heter_message
+gt_feature = heter_feature_2d
+gen_data_dict = self.gencomm(heter_feature_2d, conditions, record_len)
+pred_feature = gen_data_dict['pred_feature']
+```
+
+这里的含义是：
+
+- `gt_feature`：真实提取到的 BEV 特征，用作生成目标或监督信号。
+- `conditions`：message extractor 提取出的低维条件消息。
+- `pred_feature`：GenComm 根据条件消息生成/重建出来的 BEV 特征。
+
+随后模型直接用生成特征替换原特征：
+
+```python
+heter_feature_2d = pred_feature
+```
+
+并把真实和预测特征都放进输出：
+
+```python
+output_dict.update({
+    'gt_feature': gt_feature,
+    'pred_feature': pred_feature
+})
+```
+
+损失函数可以利用这两个字段计算 GenComm 的生成损失。
+
+### 16. GenComm 内部做了什么
+
+`GenComm` 位于 `opencood/models/gencomm_modules/cond_diff.py`。
+
+它是一个条件扩散模块。核心逻辑是：
+
+- 输入真实 BEV 特征 `spatial_features`
+- 输入条件消息 `conditions`
+- 对真实特征加噪
+- 用条件消息引导 `DiffusionUNet` 去噪
+- 输出重建后的 `pred_feature`
+
+训练时，`GenComm.forward` 会：
+
+1. 用 `record_len` 把 batch 按场景拆开
+2. 取每个场景 ego 的特征并复制到该场景所有智能体数量
+3. 对目标特征加噪
+4. 从最大扩散步开始反向采样
+5. 输出 `pred_feature`
+
+它的去噪网络调用形式是：
+
+```python
+model_out = self.denoiser(torch.cat([feat, noisy_masks], dim=1), t.float())
+```
+
+这里 `feat` 是条件，`noisy_masks` 是当前带噪特征。两者在通道维拼接后送入 U-Net。
+
+当前 YAML 中：
+
+```yaml
+gencomm:
+  model:
+    embed_dim: 258
+    in_channels: 256
+    out_ch: 256
+  diffusion:
+    num_diffusion_timesteps: 3
+```
+
+可以理解为：用 2 通道消息条件，引导扩散模型生成 256 通道 BEV 特征。
+
+### 17. forward 第四步：enhancer 和 fusion
+
+GenComm 输出后，如果特征维度退化成 3D，会补一个 batch 维：
+
+```python
+if len(heter_feature_2d.shape) == 3:
+    heter_feature_2d = heter_feature_2d.unsqueeze(0)
+```
+
+然后进入 enhancer：
+
+```python
+if hasattr(self, 'enhancer'):
+    heter_feature_2d = self.enhancer(heter_feature_2d, affine_matrix, record_len)
+```
+
+接着进入融合模块：
+
+```python
+fused_feature = self.fusion_net(heter_feature_2d, record_len, affine_matrix)
+```
+
+这里 `record_len` 和 `affine_matrix` 很关键：
+
+- `record_len` 告诉 fusion 每个 batch 样本有几个智能体。
+- `affine_matrix` 告诉 fusion 如何把协作智能体特征变换到 ego 坐标。
+
+### 18. forward 第五步：检测头输出
+
+融合后的 ego BEV 特征进入检测头：
+
+```python
+cls_preds = self.cls_head(fused_feature)
+reg_preds = self.reg_head(fused_feature)
+dir_preds = self.dir_head(fused_feature)
+```
+
+最终输出字典：
+
+```python
+output_dict.update({
+    'cls_preds': cls_preds,
+    'reg_preds': reg_preds,
+    'dir_preds': dir_preds,
+    'message': conditions
+})
+```
+
+训练损失会主要读取：
+
+- `cls_preds`
+- `reg_preds`
+- `dir_preds`
+- `gt_feature`
+- `pred_feature`
+- `message`
+
+### 19. 完整数据流总结
+
+可以把 `HeterModelBaselineWGenCommStage1` 的 forward 看成下面这条链路：
+
+```text
+batch_data['ego']
+  -> 按 agent_modality_list 判断有哪些模态
+  -> 每个模态走 encoder
+  -> 每个模态走 BEV backbone 或 identity
+  -> shrinker 统一到 256 通道 BEV 特征
+  -> MessageExtractorv2 提取 2 通道消息
+  -> 按智能体顺序 stack 成 heter_feature_2d / heter_message
+  -> GenComm 用 heter_message 生成 pred_feature
+  -> pred_feature 替换原始 heter_feature_2d
+  -> Enhancer 几何增强
+  -> AttFusion / 其他 fusion_net 协同融合
+  -> cls/reg/dir 检测头
+  -> output_dict
+```
+
+### 20. 这个模型里最容易出问题的地方
+
+1. `model.core_method` 和类名必须匹配。
+
+`heter_model_baseline_w_gencomm_stage1` 必须对应 `HeterModelBaselineWGenCommStage1`。否则会报 “backbone not found”，但真实原因是模型类没被分发器找到。
+
+2. `shrink_header.input_dim` 必须匹配 backbone 输出拼接维度。
+
+例如 `m1` 是三路 `128 + 128 + 128 = 384`，所以 `input_dim` 必须是 384。`m2` 是 256，`m3` 是 128，`m4` 是 64。
+
+3. `message_extractor.in_ch` 必须匹配 shrinker 输出通道。
+
+当前 shrinker 输出 256，因此 message extractor 输入也应是 256。
+
+4. `gencomm.model.in_channels` 和检测头 `in_head` 要与 BEV 特征通道一致。
+
+当前都是 256。
+
+5. `record_len` 和 `agent_modality_list` 必须正确。
+
+它们决定特征如何从“按模态处理”重新排列回“按智能体处理”。如果这里错了，融合对象和坐标变换会对不上。
+
+## 13. 当前工作建议
 
 如果继续做 V2X-Real 训练，建议按这个顺序：
 
