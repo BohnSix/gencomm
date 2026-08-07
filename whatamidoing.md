@@ -1373,3 +1373,83 @@ batch_data['ego']
 5. 最后进入 stage2 合并和训练
 6. 训练完成后再走 V2X-Real 的专用推理脚本
 
+## 14. V2X-Real GenComm stage1：训练完成但自动推理因 cuDNN 失败
+
+### 14.1 本次运行的事实
+
+用户提供的日志显示，V2X-Real GenComm stage1 的训练已经完成到 `[epoch 19][2826/2826]`，随后打印了 `Training Finished, checkpoints saved to ...`。这说明训练循环已经跑完，并且日志目录已经生成 checkpoint；它不等于后续推理或模型质量验证成功。
+
+[train.py:131-172](opencood/tools/train.py#L131-L172) 负责 epoch 循环、保存普通 checkpoint 和验证 checkpoint。[train.py:216-224](opencood/tools/train.py#L216-L224) 中 `run_test = True`，所以训练结束后会通过 `os.system` 自动启动 V2X-Real 推理。
+
+本次自动推理的后续行为是：
+
+1. [inference_v2xreal.py:95-124](opencood/tools/inference_v2xreal.py#L95-L124) 创建模型、加载 checkpoint 并构建测试数据集。
+2. 推理加载的是 `net_epoch_bestval_at15.pth`，即按验证损失选择的 epoch 15 checkpoint；目标目录为 `opencood/logs/GenComm/v2xreal/stage1/OPV2V_m1_att`。
+3. [inference_v2xreal.py:142-179](opencood/tools/inference_v2xreal.py#L142-L179) 在第一个 batch 上调用中间融合推理。
+4. [heter_model_baseline_w_gencomm_stage1.py:260-283](opencood/models/heter_model_baseline_w_gencomm_stage1.py#L260-L283) 执行 encoder 和 BEV backbone 时，在 [base_bev_backbone.py:40-58](opencood/models/sub_modules/base_bev_backbone.py#L40-L58) 的 `Conv2d` 处抛出 `RuntimeError: Unable to find a valid cuDNN algorithm to run convolution`。
+
+因此，本次运行目前**没有完成完整 V2X-Real 推理，也没有产生可用于报告的 AP 指标**。在推理成功前，不能仅根据训练 loss 判断最终检测质量。
+
+日志目录中可以看到 `config.yaml`、`net_epoch1.pth` 至 `net_epoch19.pth` 和 `net_epoch_bestval_at15.pth`。使用 `--model_dir` 推理时应以该日志目录中的 `config.yaml` 为准；用户日志中实际打印的数据目录为 `/data2/bohnsix/v2xreal//test`，而当前源 YAML 中的路径是 `/data/bohnsix/datasets/v2xreal/test`，两者并不完全一致。后续复现时应同时核对日志目录配置、当前源码和实际数据路径。
+
+### 14.2 训练配置和损失解释
+
+本次 m1 配置的关键参数见 [m1_att.yaml:9-14](opencood/hypes_yaml/v2xreal/GenComm_yamls/gencomm/stage1/m1_att.yaml#L9-L14)：`batch_size=1`、总训练轮数 `20`、每 `2` 个 epoch 验证和保存一次、`max_cav=5`。m1 的 BEV backbone 见 [m1_att.yaml:152-164](opencood/hypes_yaml/v2xreal/GenComm_yamls/gencomm/stage1/m1_att.yaml#L152-L164)：三层 block 的数量为 `[3, 5, 8]`，stride 为 `[2, 2, 2]`，通道为 `[64, 128, 256]`，三路上采样 stride 为 `[1, 2, 4]`，多尺度拼接后输入 shrinker 的通道为 `384`。
+
+GenComm 配置见 [m1_att.yaml:172-187](opencood/hypes_yaml/v2xreal/GenComm_yamls/gencomm/stage1/m1_att.yaml#L172-L187)：输入/输出特征通道为 `256`，消息通道为 `2`，diffusion timestep 为 `3`。优化器和调度器见 [m1_att.yaml:202-220](opencood/hypes_yaml/v2xreal/GenComm_yamls/gencomm/stage1/m1_att.yaml#L202-L220)：Adam 初始学习率为 `0.002`，weight decay 为 `1e-4`，MultiStep 在 `[10, 15]` 处按 `gamma=0.1` 衰减。
+
+损失实现见 [point_pillar_v2xreal_gencomm_loss.py:74-166](opencood/loss/point_pillar_v2xreal_gencomm_loss.py#L74-L166)。当前配置中 `reg=2.0`、`cls_weight=1.0`、`generate_weight=1`，实际关系是：
+
+```text
+total_loss = reg_loss + conf_loss + generate_weight * generate_loss
+```
+
+其中 `reg_loss` 已经乘过配置中的回归权重 `2.0`，所以日志中的 `Loc Loss` 不是未加权的原始回归损失。用户给出的 epoch 19 后段日志大致表现为：
+
+- `Conf Loss`：约 `0.59–0.89`
+- `Loc Loss`：约 `1.0–3.6`
+- `Gen Loss`：约 `0.008–0.018`
+- `Loss`：约 `1.8–4.3`
+
+这些数值没有显示出训练在 epoch 19 的最后几十个 batch 发生异常发散；但单个 batch loss 波动是正常的，不能单独证明收敛或检测性能。
+
+TensorBoard 日志目录包含多个 event 文件。读取这些文件时观察到 `Validate_Loss` 大约在 `5.55–6.47` 的范围，最近 event 文件的最后值约为 `5.50`，并且当前目录的最佳验证 checkpoint 是 `net_epoch_bestval_at15.pth`。由于多个 event 文件可能来自不同运行、续训或不同 writer，必须按 event 文件、step 和运行时间分别核对；不能把这些文件未经区分地当作一条连续实验曲线。
+
+### 14.3 对训练结果的客观判断
+
+可以确认的结论：
+
+- 训练 loop 已完成 epoch 19，并且 checkpoint 已保存。
+- 训练结束后的自动推理确实被启动。
+- 推理在第一个样本的 BEV backbone 卷积阶段失败，尚未进入完整的 GenComm、fusion、检测头和评测流程。
+
+当前不能确认的结论：
+
+- 不能确认完整推理能正常运行。
+- 不能确认 V2X-Real 的 AP@0.3/0.5/0.7。
+- 不能仅凭 `Gen Loss` 较小就确认 GenComm 生成质量良好。
+- 不能把训练结束信息解释为模型已经通过测试。
+
+### 14.4 cuDNN 错误的分层分析
+
+**已观察事实**：错误发生在 GPU 上为 `Conv2d` 选择 cuDNN 算法的阶段。当前证据首先指向运行环境、GPU 架构支持、显存状态或 CUDA/cuDNN 兼容性，而不是 loss 计算本身。
+
+**环境兼容性风险**：此前检查到运行 GPU 为 NVIDIA RTX 4090，计算能力为 `sm_89`；当前环境为 PyTorch `1.13.1+cu117`，而 `torch.cuda.get_arch_list()` 观察到的最高架构为 `sm_86`。这说明当前旧版 PyTorch/cuDNN 组合对 RTX 4090 的支持存在风险，可能导致 CUDA kernel 或 cuDNN 算法选择不完整。这个信息是高优先级线索，但不是仅凭错误文本即可完全证明的唯一根因。
+
+**显存和模型规模风险**：m1 使用四种 stage1 基座中较深的 backbone，配置的单样本最大协作智能体数为 `5`。`batch_size=1` 已经降低了 batch 维度的显存压力，但不能排除中间特征、可用显存不足、显存碎片或其他进程占用。当前错误文本没有明确写出 CUDA out-of-memory，因此不应直接把它等同于普通 OOM。
+
+**仍需验证的因素**：还需要检查首个 batch 的 shape、dtype、device 和 finite 状态，确认 checkpoint 加载时的 missing/extra keys，并核对日志目录中的 `config.yaml`、实际运行代码和当前 checkout 是否属于同一份实验来源。当前日志已经越过了模型创建阶段，所以这些 provenance 风险不能直接被认定为本次 cuDNN 错误的原因。
+
+### 14.5 推荐的排查和恢复顺序
+
+1. **先记录实际运行环境**：使用 `nvidia-smi` 和 PyTorch 查询 GPU 型号、GPU index、`CUDA_VISIBLE_DEVICES` 映射、其他占用进程、总/已用/剩余显存、PyTorch/CUDA/cuDNN 版本和 `torch.cuda.get_arch_list()`。重点确认推理实际运行在哪张 GPU 上。
+2. **做临时 cuDNN 诊断**：使用同一 checkpoint、同一份日志目录 `config.yaml` 和同一个首样本，临时禁用 cuDNN 后复测，并记录是否能够越过 backbone 卷积。如果禁用后可以继续，环境/cuDNN 算法选择问题的可能性会增加；但禁用 cuDNN 只是诊断或临时运行手段，**不是模型修复**。
+3. **选择正式环境修复路径**：优先使用明确支持 `sm_89` 的较新 PyTorch/CUDA/cuDNN 组合，并重新核对 torchvision、spconv 和本仓库自定义 CUDA 扩展；或者改用当前旧环境明确支持的 GPU。如果确认是显存问题，先清理其他进程并重新确认可用显存。
+4. **保持实验可比性**：不要仅因为 cuDNN 错误就修改 `reg`、`generate_weight`、diffusion timesteps 或 backbone 结构，这些修改会改变实验本身并使现有 checkpoint 不再可直接比较。
+5. **环境修复后完成验证**：检查 `net_epoch_bestval_at15.pth` 的 key 加载情况，检查首 batch 的 shape/dtype/device/finite 值，让首样本完整通过 encoder、backbone、GenComm、fusion 和 detection head，随后完成全量 V2X-Real 推理并生成 AP。若需要比较 checkpoint，应单独比较 epoch 15 的最佳验证模型与其他 epoch，不要把 `net_epoch19.pth` 自动保存文件误当成最佳模型。
+6. **重新整理 TensorBoard 结论**：按 event 文件核对写入时间、step 范围、续训关系和 `Validate_Loss` 来源，确认 epoch 15 是否确实是同一次训练中的最佳验证 epoch。
+
+### 14.6 本次结论
+
+本次实验的准确状态是：**stage1 训练循环完成并保存了 checkpoint，但训练结束后自动推理在第一个样本的 cuDNN 卷积阶段失败，因此当前没有完整检测评测结果。** 优先处理运行环境和 GPU/cuDNN 兼容性，再进行完整推理；在此之前不要根据训练 loss 或 `Gen Loss` 对最终 AP 和模型质量下结论。
+
